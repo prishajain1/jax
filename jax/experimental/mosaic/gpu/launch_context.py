@@ -1007,9 +1007,10 @@ class LaunchContext:
         raise ValueError("Only collective loads can be partitioned")
       collective_size = math.prod(self.cluster_size[d] for d in collective)
       if collective_size > 1:
-        if math.prod(self.cluster_size) != 2:
+        if collective != (gpu.Dimension.x,) or collective_size != 2:
           raise NotImplementedError(
-              "Partitioned loads only supported for clusters of size 2"
+              "Partitioned loads only supported along the minormost"
+              " dimension, which must have size 2"
           )
         if slice_shape[partitioned] % collective_size != 0:
           raise ValueError(
@@ -1874,16 +1875,15 @@ class LaunchContext:
           smem_space = "shared::cta"
           multicast_mod = ""
           multicast_operand = ""
+        mapped_barrier_ptr = barrier.remap_to_cluster(
+            gpu.Dimension.x, c(0, index)
+        ).get_ptr()
         llvm.inline_asm(
             ir.Type.parse("!llvm.void"),
-            [predicate, smem_ptr, tma_desc, barrier_ptr, *rev_dyn_base_indices, *multicast_mask],
+            [predicate, smem_ptr, tma_desc, mapped_barrier_ptr, *rev_dyn_base_indices, *multicast_mask],
             f"""
-            {{
-            .reg .b32 mapped_addr;
-            @$0 mapa.shared::cluster.u32 mapped_addr, $3, 0;
             @$0 cp.async.bulk.tensor.{rank}d.{smem_space}.global.tile.mbarrier::complete_tx::bytes{multicast_mod}.cta_group::2
-                                  [$1], [$2, {{{idx_operands}}}], [mapped_addr]{multicast_operand};
-            }}
+                                  [$1], [$2, {{{idx_operands}}}], [$3]{multicast_operand};
             """,
             "b,r,l,r" + ",r" * rank + ",h" * len(multicast_mask),
             has_side_effects=True,

@@ -8122,24 +8122,31 @@ class PallasCallTCGen05Test(PallasTCGen05Test):
   @parameterized.product(
       warp_level=(True, False),
       squeezed_index=(True, False),
+      cluster=((2,), (2, 2)),
   )
-  def test_copy_gmem_to_smem_partitioned(self, warp_level, squeezed_index):
+  def test_copy_gmem_to_smem_partitioned(self, warp_level, squeezed_index, cluster):
     block_size = (128, 128)
     partitioned_block_size = (block_size[0] // 2, block_size[1])
+    cluster_y = cluster[0] if len(cluster) > 1 else 1
     a = jax.random.uniform(
-        jax.random.key(0), shape=block_size, dtype=jnp.float32)
+        jax.random.key(0), shape=(cluster_y, *block_size), dtype=jnp.float32)
     if squeezed_index:
-      a = a.reshape(1, *block_size)
+      a = a.reshape(1, cluster_y, *block_size)
     b = jax.random.uniform(
-        jax.random.key(1), shape=block_size, dtype=jnp.float32)
+        jax.random.key(1), shape=(cluster_y, *block_size), dtype=jnp.float32)
     def kernel(a_gmem, b_gmem, out_gmem,
               a_smem, b_smem,
-              a_tma_barrier, b_tma_barrier, cluster_barrier):
+              tma_barriers, cluster_barrier):
       if squeezed_index:
         a_gmem = a_gmem.at[0]
+      cluster_y_idx = lax.axis_index("y") if len(cluster) > 1 else 0
+      a_gmem = a_gmem.at[cluster_y_idx]
+      b_gmem = b_gmem.at[cluster_y_idx]
       cluster_idx = lax.axis_index("x")
       out_slice = pl.ds(cluster_idx * partitioned_block_size[0],
                         partitioned_block_size[0])
+      a_tma_barrier = tma_barriers.at[0]
+      b_tma_barrier = tma_barriers.at[1]
 
       if warp_level:
         @plgpu.warp_map
@@ -8181,17 +8188,16 @@ class PallasCallTCGen05Test(PallasTCGen05Test):
         plgpu.barrier_wait(b_tma_barrier)
       plgpu.barrier_arrive(cluster_barrier)
       plgpu.barrier_wait(cluster_barrier)
-      out_gmem[out_slice] = a_smem[...] + b_smem[...]
+      out_gmem[cluster_y_idx, out_slice] = a_smem[...] + b_smem[...]
     f = self.kernel(
         kernel,
-        out_type=jax.ShapeDtypeStruct(block_size, jnp.float32),
-        cluster_names=("x",),
-        cluster=(2,),
+        out_type=jax.ShapeDtypeStruct((cluster_y, *block_size), jnp.float32),
+        cluster_names=("y", "x") if len(cluster) > 1 else ("x",),
+        cluster=cluster,
         scratch_types=(
             plgpu.SMEM(partitioned_block_size, jnp.float32),
             plgpu.SMEM(partitioned_block_size, jnp.float32),
-            plgpu.Barrier(num_arrivals=1),
-            plgpu.Barrier(num_arrivals=1),
+            plgpu.Barrier(num_arrivals=1, num_barriers=2),
             plgpu.ClusterBarrier(collective_axes=("x",)),
         ),
     )
