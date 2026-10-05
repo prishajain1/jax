@@ -166,7 +166,7 @@ Maximum error in units in the last place (ULPs) for `float32`:
 | {func}`~jax.lax.cos` | 0.5 | 2.0 | 3.5 | 3.5 | 3.5 | 3.0 | |
 | {func}`~jax.lax.cosh` | 25.0 | 2.5 | 93.5 | 99.0 | 59.0 | 59.5 | |
 | {func}`~jax.lax.erf` | 7.0 | 6.5 | 7.5 | 8.5 | 1.5 | 1.5 | |
-| {func}`~jax.lax.erf_inv` | 65.0 | 65.0 | 427.0 | 65.5 | 65.0 | 65.5 | |
+| {func}`~jax.lax.erf_inv` | 4.0 | 4.0 | 427.0 | 6.5 | 4.0 | 4.0 | |
 | {func}`~jax.lax.erfc` | 4.0 | 5.0 | 5.5 | 5.0 | 5.0 | 5.0 | |
 | {func}`~jax.lax.exp` | 1.5 | 2.0 | 116.0 | 109.5 | 64.5 | 65.0 | |
 | {func}`~jax.lax.exp` (`highest`) | 1.5 | 2.0 | 1.5 | 1.5 | 1.5 | 1.5 | `accuracy=lax.AccuracyMode.HIGHEST` |
@@ -219,7 +219,7 @@ these are empirical bounds.
 | {func}`~jax.lax.cos` | 0.5 | 1.5 |
 | {func}`~jax.lax.cosh` | 496.0 | 2.5 |
 | {func}`~jax.lax.erf` | 2.5 | 2.5 |
-| {func}`~jax.lax.erf_inv` | 500000.0 | 500000.0 |
+| {func}`~jax.lax.erf_inv` | 5.0 | 5.0 |
 | {func}`~jax.lax.erfc` | 2.5 | 2.5 |
 | {func}`~jax.lax.exp` | 2.0 | 1.5 |
 | {func}`~jax.lax.exp2` | 719.0 | 719.0 |

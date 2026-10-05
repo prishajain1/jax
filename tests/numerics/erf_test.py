@@ -419,11 +419,11 @@ class ErfinvTest(jtu.JaxTestCase):
   @parameterized.named_parameters(*DTYPE_PARAMS)
   def test_erfinv_accuracy(self, dtype):
     bounds = [
-        ("cpu", {f16: 1.0, f32: 65.0, f64: 500000.0}),
-        ("gpu", {f16: 1.0, f32: 65.0, f64: 500000.0}),
+        ("cpu", {f16: 1.0, f32: 4.0, f64: 5.0}),
+        ("gpu", {f16: 1.0, f32: 4.0, f64: 5.0}),
         (TPU_EUPV1, {f16: 1.0, f32: 427.0}),
-        (["tpu_v5p", "tpu_7x"], {f16: 1.0, f32: 65.5}),
-        ("tpu_v6e", {f16: 1.0, f32: 65.0}),
+        ("tpu_v5p", {f16: 1.0, f32: 6.5}),
+        (["tpu_v6e", "tpu_7x"], {f16: 1.0, f32: 4.0}),
     ]
     interesting_points = [
         # Minimax polynomial piece boundary points in erf_inv implementations:

@@ -260,7 +260,7 @@ def _erf_inv_32_lowering_helper(x):
     0.00943887047,   1.00167406,     2.83297682,
   ]
 
-  w = -jnp.log1p(x * -x)
+  w = -jnp.log((1 - x) * (1 + x))
   w_lt_5 = w < 5.0
 
   w = jnp.where(w_lt_5, w - 2.5, jnp.sqrt(w) - 3.0)
@@ -315,7 +315,7 @@ def _erf_inv_64_lowering_helper(x):
     4.8499064014085844221,
   ]  # should add "as jnp.float64 array"?
 
-  w = -jnp.log1p(x * -x)
+  w = -jnp.log((1 - x) * (1 + x))
   w_lt_625 = w < 6.25
   w_lt_16 = w < 16.0
 
