@@ -846,10 +846,6 @@ def flash_attention_kernel(
           logsumexp_ref.dtype
       )
 
-    m_scratch_ref[...] = jnp.zeros_like(m_scratch_ref)
-    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-    o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
-
 
 @overload
 def _splash_attention_forward(
@@ -2642,3 +2638,75 @@ make_splash_mha_single_device = partial(
 make_splash_mqa_single_device = partial(
     make_splash_mha, is_mqa=True, head_shards=1, q_seq_shards=1
 )
+
+
+def ulysses_splash_mha(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    axis_name: str = "cp",
+    *,
+    block_q: int = 1024,
+    block_kv: int = 1024,
+    causal: bool = True,
+) -> jax.Array:
+  """Ulysses context-parallel SplashAttention wrapper avoiding layout transposes.
+
+  Packs (q, k, v) along the feature dimension to perform a single fused
+  lax.all_to_all across `axis_name`, uses zero-copy reshape instead of
+  `swapaxes(0, 1)` when `h_local == 1` (`(S, 1, D) <-> (1, S, D)`), and pads
+  `head_dim` to a multiple of `NUM_LANES` (128) only when required by Mosaic TPU.
+  """
+  unbatched = q.ndim == 3
+  if not unbatched and q.ndim != 4:
+    raise ValueError(f"Expected 3D [S_local, H, D] or 4D [B, S_local, H, D] inputs, got {q.shape}")
+
+  if unbatched:
+    d_orig = q.shape[-1]
+    scale = float(d_orig ** -0.5)
+    # 1. Pack Q, K, V along feature axis into a single all_to_all collective
+    qkv = jnp.concatenate([q, k, v], axis=-1)
+    qkv = lax.all_to_all(qkv, axis_name, split_axis=1, concat_axis=0, tiled=True)
+    s_full, h_local, _ = qkv.shape
+
+    # 2. Avoid physical HBM transpose copy when each device owns a single head (h_local == 1)
+    if h_local == 1:
+      qkv_h = qkv.reshape(1, s_full, 3 * d_orig)
+    else:
+      qkv_h = jnp.swapaxes(qkv, 0, 1)
+
+    qh = (qkv_h[:, :, :d_orig] * scale).astype(q.dtype)
+    kh = qkv_h[:, :, d_orig : 2 * d_orig]
+    vh = qkv_h[:, :, 2 * d_orig :]
+
+    pad_d = (-d_orig) % NUM_LANES
+    if pad_d:
+      qh = jnp.pad(qh, ((0, 0), (0, 0), (0, pad_d)))
+      kh = jnp.pad(kh, ((0, 0), (0, 0), (0, pad_d)))
+      vh = jnp.pad(vh, ((0, 0), (0, 0), (0, pad_d)))
+
+    bq = min(int(block_q), s_full)
+    bkv = min(int(block_kv), s_full)
+    block_sizes = BlockSizes(block_q=bq, block_kv=bkv, block_kv_compute=bkv)
+    mask_cls = mask_lib.CausalMask if causal else mask_lib.FullMask
+    mask = mask_lib.MultiHeadMask([mask_cls((s_full, s_full)) for _ in range(h_local)])
+    kernel = make_splash_mha(
+        mask=mask,
+        head_shards=1,
+        q_seq_shards=1,
+        block_sizes=block_sizes,
+    )
+    out_h = kernel(qh, kh, vh)[:, :, :d_orig].astype(q.dtype)
+    if h_local == 1:
+      out = out_h.reshape(s_full, 1, d_orig)
+    else:
+      out = jnp.swapaxes(out_h, 0, 1)
+    return lax.all_to_all(out, axis_name, split_axis=0, concat_axis=1, tiled=True)
+
+  return jax.vmap(
+      lambda qb, kb, vb: ulysses_splash_mha(
+          qb, kb, vb, axis_name=axis_name, block_q=block_q, block_kv=block_kv, causal=causal
+      ),
+      in_axes=(0, 0, 0),
+      out_axes=0,
+  )(q, k, v)
