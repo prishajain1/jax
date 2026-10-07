@@ -302,6 +302,252 @@ def _zero_uninitialized_memory(
 LutFn = Callable[[int, int, int], tuple[int, int, int] | None]
 
 
+import dataclasses
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _GmmMetadataRef:
+  gm_id_to_group_id: jax.Array
+  gm_id_to_m_offset: jax.Array
+
+
+def _gmm_emit_pipeline(
+    lhs: jnp.ndarray,
+    rhs: jnp.ndarray,
+    group_sizes: jnp.ndarray,
+    group_offset: jnp.ndarray,
+    *,
+    tm: int,
+    tk: int,
+    tn: int,
+    preferred_element_type: jax.typing.DTypeLike,
+    zero_initialize: bool,
+) -> jnp.ndarray:
+  """Fast emit_pipeline GMM path with 3-buffered RHS weights and SMEM metadata."""
+  size_m, size_k = lhs.shape
+  size_group, _, size_n = rhs.shape
+  tpu_info = pltpu.get_tpu_info()
+  vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.9)
+  size_lhs_sublane = min(tpu_info.get_sublane_tiling(lhs.dtype), size_m)
+  num_lanes = tpu_info.num_lanes
+  mxu_size = tpu_info.mxu_column_size
+  out_dtype = jnp.dtype(preferred_element_type)
+  acc_dtype = jnp.dtype(jnp.float32)
+
+  tile_m = min(tm, size_m)
+  tile_k = min(tk, size_k)
+  tile_n = min(tn, size_n)
+  num_k = pl.cdiv(size_k, tile_k)
+  num_n = pl.cdiv(size_n, tile_n)
+  max_num_gm = size_group + pl.cdiv(size_m, tile_m) - 1
+
+  def _fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref):
+    g_off = group_offset_ref[0]
+    max_num_group = g_off + size_group
+    metadata_ref.gm_id_to_m_offset[0] = jnp.int32(0)
+
+    def inner_tm_loop(tm_id, curr_m_offset, *, end_m_offset, group_id):
+      local_offset = curr_m_offset % size_lhs_sublane
+      tm_size = jnp.minimum(
+          jnp.int32(tile_m) - local_offset, end_m_offset - curr_m_offset
+      )
+      metadata_ref.gm_id_to_group_id[tm_id] = group_id
+      next_m_offset = curr_m_offset + tm_size
+      metadata_ref.gm_id_to_m_offset[tm_id] = curr_m_offset
+      metadata_ref.gm_id_to_m_offset[tm_id + 1] = next_m_offset
+      return next_m_offset
+
+    def outer_group_loop(lhs_group_id, carry):
+      num_gm, start_m_offset = carry
+      group_id = lhs_group_id - g_off
+      group_size = lhs_group_sizes_ref[lhs_group_id]
+      end_m_offset = start_m_offset + group_size
+      local_offset = start_m_offset % size_lhs_sublane
+      aligned_group_size = group_size + local_offset
+      curr_num_gm = pl.cdiv(aligned_group_size, jnp.int32(tile_m))
+      should_process = jnp.logical_and(group_size > 0, group_id >= 0)
+      curr_num_gm = jnp.where(should_process, curr_num_gm, jnp.int32(0))
+      next_num_gm = num_gm + curr_num_gm
+      lax.fori_loop(
+          num_gm,
+          next_num_gm,
+          partial(inner_tm_loop, end_m_offset=end_m_offset, group_id=group_id),
+          start_m_offset,
+      )
+      return next_num_gm, end_m_offset
+
+    num_gm, _ = lax.fori_loop(
+        0, max_num_group, outer_group_loop, (jnp.int32(0), jnp.int32(0))
+    )
+    return num_gm
+
+  def _inner_kernel(
+      tiled_lhs_ref,
+      tiled_rhs_ref,
+      tiled_out_ref,
+      partial_out_ref,
+      acc_ref,
+      metadata_ref,
+  ):
+    def _matmul(is_first_k_step: bool, is_last_k_step: bool):
+      tiled_lhs = tiled_lhs_ref[...].reshape(-1, tile_k)
+      tiled_rhs = tiled_rhs_ref[...]
+      rhs_tile_n = tiled_rhs.shape[1]
+      valid_k = size_k % tile_k
+      if is_last_k_step and valid_k != 0:
+        mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+        tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+      acc_list = []
+      for start_n in range(0, rhs_tile_n, mxu_size):
+        end_n = min(rhs_tile_n, start_n + mxu_size)
+        block_acc = jnp.matmul(
+            tiled_lhs,
+            tiled_rhs[:, start_n:end_n],
+            preferred_element_type=jnp.float32,
+        ).astype(acc_ref.dtype)
+        acc_list.append(block_acc)
+      acc = jnp.concatenate(acc_list, axis=1)
+      if not is_first_k_step:
+        acc += acc_ref[...]
+      if is_last_k_step:
+        gm_id = pl.program_id(1)
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+        m_offset = m_start - m_start % size_lhs_sublane
+        m_start_local = m_start - m_offset
+        m_end_local = m_end - m_offset
+        iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+        mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+        acc_masked = jnp.where(mask, acc, 0).reshape(tiled_out_ref.shape)
+        tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype)
+        partial_out_zeros = jnp.zeros_like(partial_out_ref)
+        tiled_out_ref[0] += jnp.where(
+            gm_id == 0, partial_out_zeros, partial_out_ref[...]
+        )
+        last_row = m_end_local // size_lhs_sublane
+        partial_out_ref[...] = jnp.where(
+            m_end_local % size_lhs_sublane == 0,
+            partial_out_zeros,
+            tiled_out_ref[last_row],
+        )
+      else:
+        acc_ref[...] = acc
+
+    k_id = pl.program_id(2)
+    is_first_k_step = k_id == 0
+    is_last_k_step = k_id == (pl.num_programs(2) - 1)
+    lax.cond(
+        is_first_k_step,
+        lambda: lax.cond(
+            is_last_k_step,
+            lambda: _matmul(True, True),
+            lambda: _matmul(True, False),
+        ),
+        lambda: lax.cond(
+            is_last_k_step,
+            lambda: _matmul(False, True),
+            lambda: _matmul(False, False),
+        ),
+    )
+
+  def _kernel_main(
+      lhs_group_sizes_ref,
+      group_offset_ref,
+      lhs_ref,
+      rhs_ref,
+      out_ref,
+      partial_out_ref,
+      acc_ref,
+      metadata_ref,
+  ):
+    num_gm = _fill_metadata(lhs_group_sizes_ref, group_offset_ref, metadata_ref)
+    bounded_slice_gm = pl.BoundedSlice(tile_m // size_lhs_sublane)
+
+    def lhs_index_map(_, gm_id, k_id):
+      m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+      m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+      row_start = m_start // size_lhs_sublane
+      row_end = pl.cdiv(m_end, jnp.int32(size_lhs_sublane))
+      return (pl.ds(row_start, row_end - row_start), 0, k_id)
+
+    def rhs_index_map(n_id, gm_id, k_id):
+      return (metadata_ref.gm_id_to_group_id[gm_id], k_id, n_id)
+
+    def out_index_map(n_id, gm_id, _):
+      is_last_gm = gm_id == (pl.num_programs(1) - 1)
+      m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+      m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+      row_start = m_start // size_lhs_sublane
+      capped_row_end = m_end // size_lhs_sublane
+      last_row_end = pl.cdiv(m_end, jnp.int32(size_lhs_sublane))
+      row_end = jnp.where(is_last_gm, last_row_end, capped_row_end)
+      return (pl.ds(row_start, row_end - row_start), 0, n_id)
+
+    lhs_spec = pl.BlockSpec(
+        (bounded_slice_gm, size_lhs_sublane, tile_k), lhs_index_map
+    )
+    rhs_spec = pl.BlockSpec(
+        (None, tile_k, tile_n),
+        rhs_index_map,
+        pipeline_mode=pl.Buffered(buffer_count=3),
+    )
+    out_spec = pl.BlockSpec(
+        (bounded_slice_gm, size_lhs_sublane, tile_n), out_index_map
+    )
+    pipeline_fn = pltpu.emit_pipeline(
+        _inner_kernel,
+        grid=(jnp.int32(num_n), num_gm, jnp.int32(num_k)),
+        in_specs=(lhs_spec, rhs_spec),
+        out_specs=out_spec,
+    )
+    lhs_in = lhs_ref.reshape(-1, size_lhs_sublane, lhs_ref.shape[-1])
+    out_in = out_ref.reshape(-1, size_lhs_sublane, out_ref.shape[-1])
+    pipeline_fn(
+        lhs_in,
+        rhs_ref,
+        out_in,
+        scratches=[partial_out_ref, acc_ref, metadata_ref],
+    )
+
+  aligned_n = pl.cdiv(size_n, num_lanes) * num_lanes
+  scratch_shapes = [
+      pltpu.VMEM((size_lhs_sublane, tile_n), out_dtype),
+      pltpu.VMEM((tile_m, tile_n), acc_dtype),
+      _GmmMetadataRef(
+          gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+          gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+      ),
+  ]
+  out = pl.pallas_call(
+      _kernel_main,
+      out_shape=jax.ShapeDtypeStruct((size_m, aligned_n), out_dtype),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=2,
+          in_specs=[
+              pl.BlockSpec(memory_space=pltpu.HBM),
+              pl.BlockSpec(memory_space=pltpu.HBM),
+          ],
+          out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+          scratch_shapes=scratch_shapes,
+      ),
+      compiler_params=pltpu.CompilerParams(
+          vmem_limit_bytes=vmem_limit_bytes,
+          disable_bounds_checks=True,
+      ),
+  )(group_sizes, group_offset, lhs, rhs)[:, :size_n]
+  if zero_initialize:
+    group_ends = jnp.cumsum(group_sizes)
+    group_offsets = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), group_ends])
+    out = _zero_uninitialized_memory(
+        out,
+        start_group=group_offset[0],
+        num_nonzero_groups=size_group,
+        group_metadata=(group_offsets,),
+    )
+  return out
+
+
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -376,6 +622,22 @@ def gmm(
     raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
 
   tm, tk, tn = tiling
+
+  # Fast path: use 3-buffered emit_pipeline with sublane BoundedSlice and SMEM
+  # metadata generation when running on TPU without existing_out aliasing.
+  if not interpret and existing_out is None and not transpose_rhs:
+    return _gmm_emit_pipeline(
+        lhs,
+        rhs,
+        group_sizes,
+        group_offset,
+        tm=tm,
+        tk=tk,
+        tn=tn,
+        preferred_element_type=preferred_element_type,
+        zero_initialize=num_current_groups < num_total_groups,
+    )
+
   tiles_k, k_rem = _calculate_irregular_num_tiles(k, tk)
   tiles_n, n_rem = _calculate_irregular_num_tiles(n, tn)
   del n_rem
@@ -508,9 +770,17 @@ def gmm(
 
   lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
   if transpose_rhs:
-    rhs_block_spec = pl.BlockSpec((None, tn, tk), rhs_transform_indices)
+    rhs_block_spec = pl.BlockSpec(
+        (None, tn, tk),
+        rhs_transform_indices,
+        pipeline_mode=pl.Buffered(buffer_count=3),
+    )
   else:
-    rhs_block_spec = pl.BlockSpec((None, tk, tn), rhs_transform_indices)
+    rhs_block_spec = pl.BlockSpec(
+        (None, tk, tn),
+        rhs_transform_indices,
+        pipeline_mode=pl.Buffered(buffer_count=3),
+    )
 
   lhs_bytes = lhs.size * lhs.itemsize
   rhs_bytes = (k * n) * rhs.itemsize  # We don't read all of rhs
@@ -523,6 +793,7 @@ def gmm(
   cost_estimate = pl.CostEstimate(
       flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
   )
+  vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
   call_gmm = pl.pallas_call(
       kernel,
       out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
@@ -539,7 +810,10 @@ def gmm(
       ),
       input_output_aliases=input_output_aliases,
       compiler_params=pltpu.CompilerParams(
-              dimension_semantics=("parallel", "arbitrary", "arbitrary")),
+          dimension_semantics=("parallel", "arbitrary", "arbitrary"),
+          vmem_limit_bytes=vmem_limit_bytes,
+          disable_bounds_checks=True,
+      ),
       interpret=interpret,
       cost_estimate=cost_estimate,
   )
